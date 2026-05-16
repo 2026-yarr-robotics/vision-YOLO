@@ -13,10 +13,18 @@ import torch
 DATA_YAML   = 'YOLO_YARR/data.yaml'
 BASE_MODEL  = 'yolo26m-seg.pt'
 DEVICE      = 0
-IMGSZ       = 640
+IMGSZ       = 1280
 BATCH       = 16
 
-USE_TWO_STAGE = False  # True 로 바꾸면 2-Stage 파인튜닝 실행
+# 데이터 증강
+AUG = dict(
+    degrees=45,      # 회전 ±45°
+    hsv_h=0.015,     # Hue
+    hsv_s=0.7,       # Saturation
+    hsv_v=0.4,       # Value (밝기)
+)
+
+USE_TWO_STAGE = True #True로 바꾸면 2-Stage 파인튜닝 실행
 
 
 # ────────────────────────────────────────────────
@@ -31,15 +39,16 @@ def train_single_stage():
         imgsz=IMGSZ,
         batch=BATCH,
         optimizer='SGD',
-        lr0=0.01,
+        lr0=0.001,
         patience=20,
         device=DEVICE,
         project='runs/seg',
         name='single_stage',
+        **AUG,
     )
     print(f"  Box  mAP50: {results.results_dict['metrics/mAP50(B)']:.4f}")
     print(f"  Mask mAP50: {results.results_dict['metrics/mAP50(M)']:.4f}")
-    return 'runs/seg/single_stage/weights/best.pt'
+    return str(results.save_dir / 'weights' / 'best.pt')
 
 
 # ────────────────────────────────────────────────
@@ -66,13 +75,14 @@ def train_two_stage():
         device=DEVICE,
         project='runs/seg',
         name='two_stage_s1',
+        **AUG,
     )
     print(f"  [Stage1] Box mAP50: {r1.results_dict['metrics/mAP50(B)']:.4f}")
     print(f"  [Stage1] Mask mAP50: {r1.results_dict['metrics/mAP50(M)']:.4f}")
 
     # Stage 2
     print("▶ 2-Stage Stage 2: 전체 레이어 미세조정")
-    model2 = YOLO('runs/seg/two_stage_s1/weights/best.pt')
+    model2 = YOLO(str(r1.save_dir / 'weights' / 'best.pt'))
     for param in model2.model.parameters():
         param.requires_grad = True
 
@@ -80,17 +90,18 @@ def train_two_stage():
         data=DATA_YAML,
         epochs=70,
         imgsz=IMGSZ,
-        batch=BATCH,
+        batch=8,
         optimizer='SGD',
         lr0=0.001,
         patience=20,
         device=DEVICE,
         project='runs/seg',
         name='two_stage_s2',
+        **AUG,
     )
     print(f"  [Stage2] Box mAP50: {r2.results_dict['metrics/mAP50(B)']:.4f}")
     print(f"  [Stage2] Mask mAP50: {r2.results_dict['metrics/mAP50(M)']:.4f}")
-    return 'runs/seg/two_stage_s2/weights/best.pt'
+    return str(r2.save_dir / 'weights' / 'best.pt')
 
 
 # ────────────────────────────────────────────────
