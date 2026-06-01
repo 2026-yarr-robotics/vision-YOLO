@@ -3,6 +3,9 @@
 이 디렉토리는 **hand-eye view 이미지에서 speed stack cup을 instance segmentation**하기 위해 YOLOv26m-seg medium 모델만 파인튜닝하는 Colab 노트북을 정리한 공간입니다.
 Roboflow에서 병합 및 augmentation까지 완료된 COCO segmentation dataset을 사용한다고 가정하며, YOLO segmentation format 변환 → medium 모델 학습 → validation/test 평가 → test 전체 이미지 정성 결과 저장 → 보고서용 표/플롯 생성까지 한 번에 수행할 수 있도록 구성되어 있습니다.
 
+<p align="center">
+  <img src="asset/class_image.png" alt="yolo segmentation example" width="700"/>
+</p>
 ---
 
 ## 1. Notebook Overview
