@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eunwoo-yolo-exo-0613
+  namespace: p-test2
+  labels:
+    mlx.navercorp.com/zone: private-h200-realitylab-0
+    management.mlx.navercorp.com/project: test2
+    management.mlx.navercorp.com/workspace: realitylab
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        mlx.navercorp.com/zone: private-h200-realitylab-0
+        management.mlx.navercorp.com/project: test2
+        management.mlx.navercorp.com/workspace: realitylab
+      annotations:
+        mlx.navercorp.com/zone: private-h200-realitylab-0
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        mlx.navercorp.com/zone: private-h200-realitylab-0
+      containers:
+      - name: yolo-exo
+        image: mlx-public.kr.ncr.ntruss.com/mlx/notebook/kubeflow-jupyter:2.7.0
+        workingDir: /workspace/Projects/cup_stack/vision-YOLO/data_generator
+        # train_exo.py 가 work/exo_mix 로 chdir 후 train_segmentation_v4.py 를
+        # 무수정 import 해 2-stage 파인튜닝을 돌린다 (배치 16/8 하드코딩 그대로)
+        command: ["bash", "-c",
+                  "cp -n yolo26m-seg.pt ../work/exo_mix/ 2>/dev/null; /workspace/envs/yolo/bin/python -u train_exo.py"]
+        resources:
+          requests:
+            cpu: "12"
+            memory: 48Gi
+          limits:
+            cpu: "24"
+            memory: 96Gi
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - { name: eunwoo-workspace-1, mountPath: /workspace }
+        - { name: dshm, mountPath: /dev/shm }
+      volumes:
+      - name: eunwoo-workspace-1
+        persistentVolumeClaim: { claimName: eunwoo-workspace-1 }
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: 16Gi }
