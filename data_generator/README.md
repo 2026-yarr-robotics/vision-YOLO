@@ -69,13 +69,46 @@ python3 eval_weights.py --hand-new <hand_best.pt> --exo-new <exo_best.pt>
 - 색×클래스 직교: 4색(red/blue/green/purple) 풀에 역할을 색과 무관하게
   배정 — 0609_exo 의 red↔fallen 상관 오검 차단
 
+## 검증 결과 (2026-06-13, H200 학습)
+
+검증 기준(temp_task) 1·2 오프라인 평가 (`eval_weights.py`):
+
+| 모델 | sim fallen recall | upright→fallen 오검 | 실데이터 회귀 | 판정 |
+|---|---|---|---|---|
+| `sim_exo_best` (exo 3-class) | ~0.92 (런타임 conf0.35) | 0.6% (8/1359) | 0.960→**1.000** | ✅ |
+| `sim_hand_best` (hand yolo26s) | 0.805 (단일프레임) | 3.1% (16/517) | 0.933→0.933 | ⚠️ 게이트 미달, 이전 0건 대비 대폭 개선 |
+
+- exo 는 모든 게이트 통과 — exo 플리커·`/fallen_cups` count 워크어라운드 해제.
+- hand 단일프레임 fallen recall 0.805 는 오프라인 게이트(0.9) 미달이나
+  기존 모델의 **0건**에서의 도약. 톱다운 시점에서 누운 컵의 닫힌 바닥이
+  upright 처럼 보이는 본질적 난케이스가 잔여 오검의 주류 — recovery
+  detect 노드의 다중프레임 트래킹이 보완(라이브 기준 3 E2E 가 실검증).
+- hand `m` 백본은 별도 학습 — 더 나은 hand 모델이 나오면 핫스왑(start_isaac.sh
+  `SIM_YOLO_HAND` 한 줄).
+
+검증 기준 3(E2E recovery)·4(exo 플리커)는 통합 호스트에서 라이브 스택으로:
+`verify_recovery.py --perception`, `tools/measure_label_flicker.py`
+(둘 다 yarr-isaac-playground).
+
+## 배경 (temp_task 흡수 — 3-pose 라벨링 검증)
+
+기존 모델이 sim 전도/뒤집힘 컵을 못 잡던 근본 원인은 **표본 부재**였다
+(실데이터 hand v3 868 어노테이션 전부 upright, exo 도 fallen 217·mouth-up 0).
+3-pose 실측에서 "뒤집혀 세워짐(mouth-up)" 을 exo 가 fallen 으로 오분류,
+"넘어져 있음(lying)" 을 hand 가 upright 로 오분류했다. 생성기는 mouth-up 을
+fallen 동급 비중으로 넣어 이 혼동을 끊는다.
+
 ## 주의
 
-- 조명은 런타임 sun(DistantLight 3000) 주변 랜덤(1700~4200, 각도/색온도) +
-  돔 필 (40% 프레임은 돔 OFF — 런타임의 검은 보이드 배경 도메인 유지).
+- 조명은 런타임 sun(DistantLight 3000) 주변 랜덤(intensity 1800~3200,
+  angle 3~9° 소프트 섀도우, 각도/색온도) + 돔 필(30% 프레임 OFF — 런타임의
+  검은 보이드 배경 도메인 유지). 1차 배치의 강한 조명/날카로운 그림자는
+  사용자 지적으로 완화했다.
+- 미사용 컵은 보드 밑 주차 + **렌더 invisible** 처리 (보드 밑 컵 풀링이
+  낮은 exo 시점에서 비쳤던 문제 — 사용자 지적).
 - 그리퍼가 hand 프레임 하단에 실기처럼 등장하도록 로봇 전체를 로드하고
   관절 뱅크(유효 FK 자세 700개)에서 프레임마다 선택 — 85% 는 컵 근처를
   보도록 편향, 나머지는 hard-negative 빈 보드 뷰.
 - `gen_yolo_dataset.py` 는 yarr-isaac-playground 의 scene 모듈을 직접
-  import 한다 (`--playground` 또는 자동 탐지). 완료 후 playground
-  `tools/` 로 커밋해 관리한다 (temp_task 반영 항목).
+  import 한다 (`--playground` 또는 자동 탐지) — 이 디렉토리(vision-YOLO/
+  data_generator)에서 관리한다.

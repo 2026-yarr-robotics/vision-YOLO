@@ -6,3 +6,6 @@ dataset/
 work/
 *.zip
 __pycache__/
+
+# 다운로드 가능한 베이스 가중치 (학습 시 ultralytics 자동 fetch)
+data_generator/*.pt
