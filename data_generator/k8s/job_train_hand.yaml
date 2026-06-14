@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: eunwoo-yolo-hand-0613
+  name: eunwoo-yolo-hand-v7
   namespace: p-test2
   labels:
     mlx.navercorp.com/zone: private-h200-realitylab-0
@@ -28,20 +28,18 @@ spec:
         image: mlx-public.kr.ncr.ntruss.com/mlx/notebook/kubeflow-jupyter:2.7.0
         workingDir: /workspace/Projects/cup_stack/vision-YOLO/data_generator
         command: ["/workspace/envs/yolo/bin/python", "-u", "train_hand.py",
-                  # H200 141GB × 0.34 ≈ A100-80GB × 0.60 (노트북 기준 VRAM) —
-                  # 노트북과 같은 절대 배치 영역을 유지하기 위한 환경 적응
-                  "--sizes", "s,m", "--batch", "0.34"]
+                  # DDP needs a FIXED batch that's a multiple of GPU count (4).
+                  # 128 = 32/GPU ≈ 88GB/144GB (61%) — better H200 utilization +
+                  # fewer DDP syncs/epoch → faster wall-clock (사용자: hand 가속).
+                  "--sizes", "s", "--batch", "128"]
         env:
-        - name: YOLO_OFFLINE_DISABLE
-          value: "0"
+        # NO cache=ram: with 4 DDP ranks it loads 4 copies of the dataset into
+        # host RAM (≈80GB) + batch-128 prefetch → container OOMKilled. PVC read
+        # is fast (~186MB/s), so disk loading costs little. (사용자: hand 가속)
+        - { name: YOLO_DEVICE, value: "0,1,2,3" }       # 4×H200 DDP
         resources:
-          requests:
-            cpu: "12"
-            memory: 48Gi
-          limits:
-            cpu: "24"
-            memory: 96Gi
-            nvidia.com/gpu: "1"
+          requests: { cpu: "32", memory: 160Gi }
+          limits:   { cpu: "48", memory: 384Gi, nvidia.com/gpu: "4" }
         volumeMounts:
         - { name: eunwoo-workspace-1, mountPath: /workspace }
         - { name: dshm, mountPath: /dev/shm }
@@ -49,4 +47,4 @@ spec:
       - name: eunwoo-workspace-1
         persistentVolumeClaim: { claimName: eunwoo-workspace-1 }
       - name: dshm
-        emptyDir: { medium: Memory, sizeLimit: 16Gi }
+        emptyDir: { medium: Memory, sizeLimit: 128Gi }  # DDP shared memory

@@ -173,6 +173,31 @@ def q_body_z(q):
                      1 - 2 * (x * x + y * y)])
 
 
+def q_axes(q):
+    """World directions of the body X, Y, Z axes (rotation-matrix columns)."""
+    w, x, y, z = (float(v) for v in q)
+    ux = np.array([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)])
+    uy = np.array([2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)])
+    uz = np.array([2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)])
+    return ux, uy, uz
+
+
+def settle_z(ori, top_r: float = 0.027, floor_eps: float = 0.001) -> float:
+    """DETERMINISTIC floor placement (사용자 2026-06-14 — replaces the flaky
+    bbox drop that left fallen cups floating). The cup is a frustum with a
+    bottom rim (CUP_R_BOT @ body-z 0) and a top rim (top_r @ body-z CUP_H); a
+    convex frustum's lowest contact is always on one of those rim circles. For
+    a rim at body height `bz` with radius `r`, its lowest WORLD-z relative to
+    the cup origin is bz*uz_z − r*√(ux_z²+uy_z²). Return the origin z that puts
+    the lowest rim point on the board (z=floor_eps) — exact for any orientation
+    (upright, mouth-up, fallen at any tilt)."""
+    ux, uy, uz = q_axes(ori)
+    rim_zext = math.sqrt(ux[2] ** 2 + uy[2] ** 2)        # circle's z half-extent factor
+    min_rel = min(0.0 * uz[2] - CUP_R_BOT * rim_zext,    # bottom rim (bz=0)
+                  CUP_H * uz[2] - top_r * rim_zext)       # top rim (bz=CUP_H)
+    return floor_eps - min_rel
+
+
 # ── scene build (runtime parity) ──────────────────────────────────────────
 cfg = dict(CFG)
 cfg["cups"] = dict(CFG["cups"])
@@ -217,18 +242,22 @@ def write_usd_pose(cup, pos, ori) -> None:
                 op.Set(Gf.Quatf(w, Gf.Vec3f(x, y, z)))
 
 
-def author_cup(cup, pos, ori, visible: bool = True) -> None:
+def author_cup(cup, pos, ori, visible: bool = True, settle: bool = True) -> None:
     """Kinematic frozen-author (cup_reset pattern): kinematic FIRST, then the
-    USD xform is authoritative for renderer + PhysX kinematic target."""
+    USD xform is authoritative for renderer + PhysX kinematic target.
+
+    settle=True (ground cups): the z is RECOMPUTED from the orientation via
+    settle_z so the cup rests exactly on the board — deterministic, fixes the
+    floating fallen cups (사용자 2026-06-14). settle=False (pyramid tiers):
+    keep the authored stacked z so the stack survives."""
     set_kinematic(cup.prim_path, True)
+    pos = np.asarray(pos, float)
+    if visible and settle:
+        pos = np.array([pos[0], pos[1], settle_z(ori)])
     write_usd_pose(cup, pos, ori)
-    cup.set_world_pose(position=np.asarray(pos, float),
-                       orientation=np.asarray(ori, float))
+    cup.set_world_pose(position=pos, orientation=np.asarray(ori, float))
     img = UsdGeom.Imageable(stage.GetPrimAtPath(cup.prim_path))
-    if visible:
-        img.MakeVisible()
-    else:
-        img.MakeInvisible()
+    img.MakeVisible() if visible else img.MakeInvisible()
 
 
 # semantics: one distinct label per cup so instance ids map back to GT poses
@@ -273,12 +302,41 @@ for name, entry in cams.items():
         raise SystemExit("no instance segmentation annotator available")
     annotators[name] = {"camera": camera, "iseg": iseg}
 
+
+def render_until_converged(max_steps: int = 60, thresh: float = 0.45,
+                           min_steps: int = 6) -> int:
+    """Render the scene like the LIVE stack does — until the RTX temporal
+    denoiser CONVERGES (사용자 2026-06-14). gen_yolo teleports all cups to a
+    fresh scene each frame; with only ~3 render steps the denoiser still carries
+    the PREVIOUS scene as translucent GHOSTS and the shadows stay blotchy
+    (sim_000046). The live stack renders continuously so its frames are clean.
+    Step until the exo frame stops changing (mean abs Δ < thresh) → ghost-free,
+    converged frames that match the live render."""
+    ref = annotators.get("exo", annotators[next(iter(annotators))])["camera"]
+    prev = None
+    for s in range(max_steps):
+        world.step(render=True)
+        if s < min_steps:
+            continue
+        rgba = ref.get_rgba()
+        if hasattr(rgba, "numpy"):
+            rgba = rgba.numpy()
+        rgba = np.asarray(rgba)
+        if rgba.ndim != 3:
+            continue
+        cur = rgba[:, :, :3].astype(np.int16)
+        if prev is not None:
+            if float(np.mean(np.abs(cur - prev))) < thresh:
+                return s + 1
+        prev = cur
+    return max_steps
+
 # ── lighting randomizer ────────────────────────────────────────────────────
 sun_prim = stage.GetPrimAtPath("/World/sun")
 sun = UsdLux.DistantLight(sun_prim)
 sun_rot_op = UsdGeom.Xformable(sun_prim).GetOrderedXformOps()[0]
 dome = UsdLux.DomeLight.Define(stage, "/World/dome_fill")
-dome.CreateIntensityAttr(150.0)
+dome.CreateIntensityAttr(0.0)   # off by default — live render has no dome fill
 board_color_attr = stage.GetPrimAtPath("/World/board").GetAttribute(
     "primvars:displayColor")
 BOARD_RGB = np.array([0.55, 0.42, 0.26])
@@ -296,21 +354,23 @@ def kelvin_rgb(k: float) -> Gf.Vec3f:
 
 
 def randomize_lights(rng: random.Random) -> None:
-    # User pass on the first 3000-frame batch: lighting too strong, shadows
-    # too harsh/non-uniform. Tightened intensity, WIDE distant-light angle
-    # (default 0.53° point-sun → razor shadows; 3..9° gives a penumbra), and
-    # an always-on dome fill so shadowed cups keep readable texture.
-    sun.GetIntensityAttr().Set(10 ** rng.uniform(math.log10(1800), math.log10(3200)))
-    sun.CreateColorAttr(kelvin_rgb(rng.uniform(4200, 7000)))
-    sun.CreateAngleAttr(rng.uniform(3.0, 9.0))
-    sun_rot_op.Set(Gf.Vec3f(rng.uniform(-60, -30), rng.uniform(-40, 40),
-                            rng.uniform(0, 360)))
-    # 30% dome-off keeps the runtime black-void background in-domain; safe
-    # now that the sun itself is soft (angle + tighter intensity)
-    dome.GetIntensityAttr().Set(0.0 if rng.random() < 0.3 else rng.uniform(80, 250))
-    dome.CreateColorAttr(kelvin_rgb(rng.uniform(4500, 7000)))
-    tint = BOARD_RGB * rng.uniform(0.88, 1.08)
-    board_color_attr.Set([Gf.Vec3f(*np.clip(tint, 0, 1).tolist())])
+    # MATCH THE LIVE main.py RENDER (사용자 지시 2026-06-14). The previous
+    # pass added a dome fill + soft wide-angle sun + board tint that skewed the
+    # training distribution BRIGHT (μ≈142) and SOFT, away from the live digital
+    # twin which uses scene_builder's bare default — DistantLight 3000, sharp
+    # (default 0.53° angle), NO dome (black void), untinted board (live μ≈108).
+    # The finetuned model then underfit the live-like darker/sharper regime and
+    # regressed on the actual deployment target. Center tightly on the live
+    # config; photometric robustness comes from the TRAINING augmentation
+    # (lightaug/redlite hand, AUG exo), not the renderer.
+    sun.GetIntensityAttr().Set(rng.uniform(2700.0, 3300.0))   # live 3000 ±10%
+    sun.CreateColorAttr(kelvin_rgb(rng.uniform(5500, 6800)))  # near-neutral
+    sun.CreateAngleAttr(rng.uniform(0.4, 1.2))                # sharp, like live
+    sun_rot_op.Set(Gf.Vec3f(rng.uniform(-42, -28), rng.uniform(12, 28),
+                            rng.uniform(-15, 15)))            # live default ±jitter
+    dome.GetIntensityAttr().Set(0.0)                          # no fill — black void
+    # untinted board (live is fixed BOARD_RGB)
+    board_color_attr.Set([Gf.Vec3f(*BOARD_RGB.tolist())])
 
 
 # ── arm pose bank (hand-camera viewpoints from valid joint configs) ───────
@@ -340,7 +400,18 @@ HAND_CAM_PATH = f"{assembly['ee_path']}/hand_cam" if "hand" in VIEWS else None
 J_RANGES = [(-95, 95), (-15, 70), (25, 120), (-50, 50), (35, 145), (-180, 180)]
 
 
-def build_pose_bank(rng: random.Random, want: int = 700, tries: int = 9000):
+# strict top-down: the hand cam optical axis must point essentially straight
+# DOWN (사용자 지시 2026-06-14 — "지면을 수직으로 내려다봄"). The live recovery/
+# pick approach is top-down, so training the hand model only on vertical views
+# matches the deployment. -cos(15°)=-0.966 → within ~15° of vertical.
+TOPDOWN_COS = -0.966
+
+
+def build_pose_bank(rng: random.Random, want: int = 800, tries: int = 80000):
+    """Random valid joint configs whose hand camera looks ~straight down.
+    EE (x,y) and camera height z vary across the bank (사용자 지시: EE pos random,
+    방향은 항상 수직). Rejection-sampled; joint_5 (wrist pitch) biased toward the
+    range that orients the tool downward to keep the yield workable."""
     bank = []
     for _ in range(tries):
         if len(bank) >= want:
@@ -349,12 +420,10 @@ def build_pose_bank(rng: random.Random, want: int = 700, tries: int = 9000):
         set_arm(q)
         world.step(render=False)
         pos, fwd = cam_world(HAND_CAM_PATH)
-        # near-top-down only (≤ ~37° tilt): obliquer views let the upper arm
-        # block most of the frame (smoke preview frame 0)
-        if not (0.25 <= pos[2] <= 0.95) or fwd[2] > -0.80:
-            continue
+        if not (0.25 <= pos[2] <= 0.95) or fwd[2] > TOPDOWN_COS:
+            continue                                  # reject non-vertical
         t = -pos[2] / fwd[2]
-        hit = pos + t * fwd
+        hit = pos + t * fwd                           # table intersection (EE x,y)
         if not (0.18 <= t <= 1.10 and 0.0 <= hit[0] <= 0.95 and abs(hit[1]) <= 0.50):
             continue
         xf_cache.Clear()
@@ -414,91 +483,202 @@ def mouthup_pose(xy, rng):
 
 
 def fallen_pose(xy, rng):
-    """Rest on rim + slant: axis pitched down by the frustum half-angle."""
-    elev = -math.degrees(LYING_ELEV) + rng.uniform(-2.0, 2.0)
+    """Rest on rim + slant: axis pitched down by the frustum half-angle.
+
+    The cup USD origin sits at ONE END (bottom); a lying cup extends a full
+    CUP_H along its axis from there. Author the origin shifted back by half the
+    height so the cup BODY is CENTRED on `xy` — then the isotropic min_sep
+    clearance check is valid (사용자 2026-06-14: fallen cups were still
+    overlapping because the end-origin body reached into neighbours).
+
+    Tilt sign (사용자 2026-06-14): the cup is a frustum — the WIDE end (open
+    mouth, r=0.039) and the NARROW end (closed bottom, r=0.027). Lying on its
+    side it rests on both rims, so the axis tilts DOWN toward the narrow closed
+    bottom (axis_z: wide 0.039 → narrow 0.027). body +Z points wide→narrow, so
+    it must pitch DOWN by LYING_ELEV (+, not −) — a − tilted the closed bottom
+    UP, the wrong way."""
+    elev = math.degrees(LYING_ELEV) + rng.uniform(-2.0, 2.0)
     q = qmul(qaxis((0, 0, 1), rng.uniform(0, 360)),
              qmul(qaxis((0, 1, 0), 90.0 + elev), qaxis((0, 0, 1), rng.uniform(0, 360))))
     z = CUP_R_BOT * math.cos(LYING_ELEV) + 0.002
-    return np.array([xy[0], xy[1], z]), q
+    ax = q_body_z(q)                              # world dir the body extends along
+    cx = xy[0] - 0.5 * CUP_H * float(ax[0])
+    cy = xy[1] - 0.5 * CUP_H * float(ax[1])
+    return np.array([cx, cy, z]), q
+
+
+def pose_for(kind: str, xy, rng):
+    return {"fallen": fallen_pose, "mouthup": mouthup_pose,
+            "upright": upright_pose}[kind](xy, rng)
+
+
+# Minimum centre-to-centre separation so cups never interpenetrate
+# (사용자 2026-06-14): an UPRIGHT/mouth-up footprint is the cup DIAMETER, but a
+# FALLEN cup lies on its side so its footprint is the cup HEIGHT (0.095) — use
+# that as the clearance for any pair involving a fallen cup.
+UPRIGHT_SEP = CUP_R_BOT * 2 + 0.014          # diameter 0.078 + clear gap (≈0.092)
+# fallen cup is now CENTRED on its xy (fallen_pose) so half-length+half-length
+# along the worst-case axis = CUP_H; +margin for the rounded ends.
+FALLEN_SEP = CUP_H + 0.014                     # ≈ 0.109
+
+
+def min_sep(a: str, b: str) -> float:
+    return FALLEN_SEP if (a == "fallen" or b == "fallen") else UPRIGHT_SEP
+
+
+def place_near(rng, center, kind, placed, r_max=0.20, tries=50):
+    """Random XY within r_max of center with kind-aware clearance to every
+    already-placed (xy, kind) — packs tight (live staging/recovery layouts)
+    WITHOUT interpenetration."""
+    for _ in range(tries):
+        r, a = rng.uniform(0.0, r_max), rng.uniform(0, 2 * math.pi)
+        xy = (center[0] + r * math.cos(a), center[1] + r * math.sin(a))
+        if not (WS_X[0] <= xy[0] <= WS_X[1] and WS_Y[0] <= xy[1] <= WS_Y[1]):
+            continue
+        if np.hypot(*xy) < 0.20:
+            continue
+        if np.hypot(xy[0] - MARKER_XY[0], xy[1] - MARKER_XY[1]) < 0.10:
+            continue
+        if all(np.hypot(xy[0] - p[0][0], xy[1] - p[0][1]) >= min_sep(kind, p[1])
+               for p in placed):
+            return xy
+    return None
+
+
+def valid_center(rng, x_range=(0.18, 0.66), y_range=(-0.30, 0.30)):
+    for _ in range(40):
+        c = (rng.uniform(*x_range), rng.uniform(*y_range))
+        if np.hypot(*c) > 0.24 and np.hypot(c[0] - MARKER_XY[0], c[1] - MARKER_XY[1]) > 0.10:
+            return c
+    return (0.42, 0.0)
 
 
 def randomize_scene(rng: random.Random):
-    """Author all 14 cups; returns [(cup_idx, pos, quat, class_name)]."""
+    """Author all 14 cups; returns [(cup_idx, pos, quat, class_name)].
+
+    Scene archetypes cover the LIVE OPERATING distribution (사용자: 라이브 캡처),
+    not just clean scatter — the v1/v2 finetunes worked on scattered holdouts but
+    FAILED on the live staging/recovery scenes (tight clusters of uprights with a
+    fallen cup mixed in). Archetypes: dense cluster + fallen_clear(직립열+전도) +
+    pyramid + scatter + background."""
     order = list(range(N_CUPS))
     rng.shuffle(order)
     placements = []          # (pos, ori)
     placed_xy = []
 
-    if rng.random() >= 0.05:                          # 5% pure-background frames
-        n_layers = rng.choices([0, 1, 2, 3, 4],
-                               weights=[0.30, 0.10, 0.15, 0.20, 0.25])[0]
-        slots, scatter_fallen_near = [], None
-        if n_layers:
-            for _ in range(40):
-                c = (rng.uniform(0.18, 0.66), rng.uniform(-0.32, 0.32))
-                s = pyramid_slots(c, n_layers, rng.uniform(0, 360), rng)
-                ok = all(WS_X[0] <= p[0] <= WS_X[1] and WS_Y[0] <= p[1] <= WS_Y[1]
-                         and np.hypot(p[0] - MARKER_XY[0], p[1] - MARKER_XY[1]) > 0.13
-                         and np.hypot(p[0], p[1]) > 0.22 for p in s)
-                if ok:
-                    slots = s
-                    scatter_fallen_near = c
-                    break
-            mode = rng.choices(["complete", "building", "collapsed"],
-                               weights=[0.45, 0.30, 0.25])[0]
-            extra_fallen = 0
-            if slots and mode == "building" and len(slots) > 1:
-                slots = slots[: rng.randint(1, len(slots) - 1)]
-            elif slots and mode == "collapsed" and len(slots) > 1:
-                extra_fallen = rng.randint(1, min(4, len(slots) - 1))
-                slots = slots[: len(slots) - extra_fallen]
-            for p in slots:
-                placements.append((np.array([p[0], p[1], p[2]]),
-                                   qaxis((0, 0, 1), rng.uniform(0, 360))))
-                placed_xy.append((p[0], p[1]))
-            for _ in range(extra_fallen):              # collapsed cups scatter
-                xy = sample_xy(rng, placed_xy, near=scatter_fallen_near)
-                if xy:
-                    pos, q = fallen_pose(xy, rng)
-                    placements.append((pos, q))
-                    placed_xy.append(xy)
+    arch = rng.choices(
+        ["cluster", "fallen_clear", "pyramid", "scatter", "background"],
+        weights=[0.24, 0.16, 0.28, 0.27, 0.05])[0]
 
-        budget = N_CUPS - len(placements)
-        wt = [0.35, 0.30, 0.20, 0.15]
-        n_fallen = min(budget, rng.choices([0, 1, 2, 3], weights=wt)[0])
-        budget -= n_fallen
-        # mouth-up needs FALLEN-level representation (temp_task: the deployed
-        # models confuse the two); fallen also accrues from collapsed pyramids
-        # + marker extras, so mouth-up gets a slightly hotter distribution
-        n_mouthup = min(budget, rng.choices([0, 1, 2, 3],
-                                            weights=[0.22, 0.33, 0.27, 0.18])[0])
-        budget -= n_mouthup
-        n_upright = min(budget, rng.randint(0, 4))
-        marker_fallen = rng.random() < 0.12
+    # ── dense cluster: K cups packed tight (live staging/dense table) ──────
+    if arch == "cluster":
+        center = valid_center(rng)
+        n = rng.randint(5, 12)
+        r_max = rng.uniform(0.12, 0.22)
+        placed = []                                   # (xy, kind) — clearance track
+        for _ in range(n):
+            kind = rng.choices(["upright", "fallen", "mouthup"],
+                               weights=[0.62, 0.26, 0.12])[0]
+            xy = place_near(rng, center, kind, placed, r_max=r_max)
+            if xy:
+                placements.append(pose_for(kind, xy, rng))
+                placed.append((xy, kind))
+        return _finish_scene(rng, order, placements, placed)
 
-        for kind, n in (("fallen", n_fallen), ("mouthup", n_mouthup),
-                        ("upright", n_upright)):
+    # ── fallen_clear-style: tight cluster of uprights + 1-2 fallen nearby ──
+    if arch == "fallen_clear":
+        center = valid_center(rng, x_range=(0.20, 0.42))
+        placed = []
+        for _ in range(rng.randint(3, 7)):
+            xy = place_near(rng, center, "upright", placed, r_max=0.16)
+            if xy:
+                placements.append(pose_for("upright", xy, rng))
+                placed.append((xy, "upright"))
+        for _ in range(rng.randint(1, 2)):            # fallen cup(s) — height clearance
+            xy = place_near(rng, center, "fallen", placed, r_max=0.26)
+            if xy:
+                placements.append(pose_for("fallen", xy, rng))
+                placed.append((xy, "fallen"))
+        if rng.random() < 0.3:
+            xy = place_near(rng, center, "mouthup", placed, r_max=0.22)
+            if xy:
+                placements.append(pose_for("mouthup", xy, rng))
+                placed.append((xy, "mouthup"))
+        return _finish_scene(rng, order, placements, placed)
+
+    if arch == "background":                          # empty board
+        return _finish_scene(rng, order, placements, placed_xy)
+
+    # ── pyramid: 1-4 tier stack, complete/building/collapsed ──────────────
+    if arch == "pyramid":
+        n_layers = rng.choices([1, 2, 3, 4], weights=[0.12, 0.20, 0.30, 0.38])[0]
+        slots, near = [], None
+        for _ in range(40):
+            c = valid_center(rng)
+            s = pyramid_slots(c, n_layers, rng.uniform(0, 360), rng)
+            if all(WS_X[0] <= p[0] <= WS_X[1] and WS_Y[0] <= p[1] <= WS_Y[1]
+                   and np.hypot(p[0] - MARKER_XY[0], p[1] - MARKER_XY[1]) > 0.13
+                   and np.hypot(p[0], p[1]) > 0.22 for p in s):
+                slots, near = s, c
+                break
+        mode = rng.choices(["complete", "building", "collapsed"],
+                           weights=[0.45, 0.30, 0.25])[0]
+        extra_fallen = 0
+        if slots and mode == "building" and len(slots) > 1:
+            slots = slots[: rng.randint(1, len(slots) - 1)]
+        elif slots and mode == "collapsed" and len(slots) > 1:
+            extra_fallen = rng.randint(1, min(4, len(slots) - 1))
+            slots = slots[: len(slots) - extra_fallen]
+        for p in slots:
+            # pyramid tiers are STACKED — keep their authored z (settle=False)
+            placements.append((np.array([p[0], p[1], p[2]]),
+                               qaxis((0, 0, 1), rng.uniform(0, 360)), False))
+            placed_xy.append((p[0], p[1]))
+        for _ in range(extra_fallen):
+            xy = sample_xy(rng, placed_xy, near=near)
+            if xy:
+                placements.append(fallen_pose(xy, rng))
+                placed_xy.append(xy)
+        # a few scattered extras around the stack
+        for kind, n in (("fallen", rng.randint(0, 2)), ("upright", rng.randint(0, 2))):
             for _ in range(n):
-                xy = sample_xy(rng, placed_xy,
-                               avoid_marker=not (kind != "upright" and rng.random() < 0.06))
-                if xy is None:
-                    continue
-                pos, q = {"fallen": fallen_pose, "mouthup": mouthup_pose,
-                          "upright": upright_pose}[kind](xy, rng)
-                placements.append((pos, q))
-                placed_xy.append(xy)
-        if marker_fallen and len(placements) < N_CUPS:
-            xy = (MARKER_XY[0] + rng.uniform(-0.03, 0.03),
-                  MARKER_XY[1] + rng.uniform(-0.03, 0.03))
-            if far_enough(xy, placed_xy):
-                pos, q = fallen_pose(xy, rng)
-                placements.append((pos, q))
-                placed_xy.append(xy)
+                xy = sample_xy(rng, placed_xy)
+                if xy:
+                    placements.append(pose_for(kind, xy, rng))
+                    placed_xy.append(xy)
+        return _finish_scene(rng, order, placements, placed_xy)
 
+    # ── scatter: spread cups across the board (general robustness) ────────
+    n_fallen = rng.choices([0, 1, 2, 3], weights=[0.35, 0.30, 0.20, 0.15])[0]
+    n_mouthup = rng.choices([0, 1, 2, 3], weights=[0.22, 0.33, 0.27, 0.18])[0]
+    n_upright = rng.randint(0, 5)
+    for kind, n in (("fallen", n_fallen), ("mouthup", n_mouthup),
+                    ("upright", n_upright)):
+        for _ in range(n):
+            xy = sample_xy(rng, placed_xy,
+                           avoid_marker=not (kind != "upright" and rng.random() < 0.06))
+            if xy:
+                placements.append(pose_for(kind, xy, rng))
+                placed_xy.append(xy)
+    if rng.random() < 0.12 and len(placements) < N_CUPS:    # fallen on the marker
+        xy = (MARKER_XY[0] + rng.uniform(-0.03, 0.03),
+              MARKER_XY[1] + rng.uniform(-0.03, 0.03))
+        if far_enough(xy, placed_xy):
+            placements.append(fallen_pose(xy, rng))
+            placed_xy.append(xy)
+    return _finish_scene(rng, order, placements, placed_xy)
+
+
+def _finish_scene(rng, order, placements, placed_xy):
+    """Author cups, derive class from GT orientation, park the rest hidden.
+    Placement item = (pos, ori) [ground → settle to board] or (pos, ori, False)
+    [pyramid tier → keep stacked z]."""
     gt = []
-    for slot, (pos, ori) in enumerate(placements):
+    for slot, item in enumerate(placements):
+        pos, ori = item[0], item[1]
+        settle = item[2] if len(item) > 2 else True
         idx = order[slot]
-        author_cup(cups[idx], pos, ori)
+        author_cup(cups[idx], pos, ori, settle=settle)
         cz = float(q_body_z(ori)[2])
         if cz >= UPRIGHT_COS:
             cls = "upright-cup"
@@ -778,8 +958,7 @@ def main() -> None:
             cams["exo"]["camera"].set_world_pose(
                 pos, scene_builder.look_at_quat_wxyz(pos, look), camera_axes="ros")
 
-        for _ in range(args.settle_renders):
-            world.step(render=True)
+        conv_steps = render_until_converged()       # like live: render till clean
 
         split = split_of(idx)
         gt_json = [{"cup": i, "pos": [round(float(v), 4) for v in p],

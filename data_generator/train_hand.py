@@ -17,6 +17,7 @@ import argparse
 import gc
 import json
 import math
+import os
 import random
 import shutil
 import zipfile
@@ -74,7 +75,7 @@ np.random.seed(AUG_SEED)
 
 TRAIN_BATCH = float(args.batch) if "." in str(args.batch) else int(args.batch)
 EVAL_BATCH = 8
-CACHE_MODE = False
+CACHE_MODE = os.environ.get("YOLO_CACHE") or False   # 'ram'/'disk' for fast loading
 PRED_CONF = 0.25
 PRED_IOU = 0.70
 
@@ -89,7 +90,8 @@ EVAL_PROJECT = WORK / "runs" / "segment_eval"
 EXPERIMENT_TAG = f"3class_lightaug_{AUG_TAG}_simmix"
 DRIVE_AUG_DATASET_DIR = WORK / "unused_drive_aug"
 
-DEVICE = 0 if torch.cuda.is_available() else "cpu"
+# YOLO_DEVICE='0,1,2,3' → multi-GPU DDP (near-linear speedup on H200 node)
+DEVICE = (os.environ.get("YOLO_DEVICE", "0") if torch.cuda.is_available() else "cpu")
 POSSIBLE_SPLITS = ["train", "valid", "val", "test"]
 
 # ── exec the notebook's own cells on this namespace ───────────────────────

@@ -25,7 +25,8 @@ os.chdir(EXO_MIX)                  # DATA_YAML resolves exactly like the lab set
 sys.path.insert(0, str(ROOT / "exo-view" / "finetune-medium"))
 import train_segmentation_v4 as t  # noqa: E402  (pipeline code, unmodified)
 
-t.DEVICE = "0"                     # env adaptation: single local GPU
+import os
+t.DEVICE = os.environ.get("YOLO_DEVICE", "0")   # '0,1,2,3' → multi-GPU DDP
 
 best = t.train_two_stage()
 t.evaluate(best)
